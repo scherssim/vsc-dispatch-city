@@ -1,4 +1,5 @@
 .DS_Store
+.block-backups/
 .idea/
 .vscode/
 *.log
