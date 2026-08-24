@@ -1,4 +1,4 @@
-# Block 5 – Abnahme (Aufgaben 1 bis 3)
+# Block 5 – Abnahme
 
 Durchgeführt am 24.08.2026 auf demselben k3d-Cluster `teko-k8s` (Kontext `k3d-teko-k8s`),
 K3s v1.35.5+k3s1, drei Nodes Ready. Der Namespace `food-delivery` aus Block 4 lief noch und
@@ -8,8 +8,7 @@ Ausgangsstand: eigener Projektstand nach Block 4 (Commit `AB4: Ingress und exter
 Abnahme`). Darüber installiert: `SwitzerChees/vsc-dispatch-city-05-messaging`, Tag `v1.1.0`
 (Commit `eef2d40`), geklont nach `../vsc-dispatch-city-05-messaging`.
 
-Die Aufgaben 4 und 5 (Rückstau mit Competing Consumers, Dead Letter Queue) sind bewusst noch
-offen und folgen in einem eigenen Durchgang.
+Alle fünf Aufgaben des Arbeitsblatts sind durchgeführt.
 
 ## Was der Baustein mitbringt
 
@@ -237,6 +236,149 @@ Parallel dazu produziert `customer-simulator-0` alle 15 Sekunden von sich aus Be
 `/metrics` nach dem Durchlauf: `food_delivery_delivered_orders_total 8`,
 `food_delivery_events_total 269`, `food_delivery_active_orders 2`.
 
+## Aufgabe 4 – Rückstau erzeugen und mit Competing Consumers abbauen
+
+### Vorbereitung: die Messung isolieren
+
+Vor dem Skalieren habe ich die Simulation über `POST /api/v1/simulation/pause` angehalten. Grund:
+`customer-simulator-0` produziert alle 15 Sekunden im Wechsel über die drei Restaurants
+selbstständig Bestellungen, also rund alle 45 Sekunden eine Pizza-Order. Ohne Pause wäre der
+gemessene Rückstau nicht die publizierte Acht, sondern acht plus Drift. Der Simulator hört auf
+`simulation.paused` und stellt sein Publizieren ein (`cmd/customer-simulator/main.go:61`) — die
+Pause wirkt also über denselben Eventweg, den die Aufgabe untersucht, und nicht per Eingriff von
+aussen. Das ist eine Ergänzung zum Arbeitsblatt zugunsten eines reproduzierbaren Messwerts.
+
+### Rückstau ohne Consumer
+
+```
+kubectl -n food-delivery scale deployment/restaurant-pizza --replicas=0
+kubectl -n food-delivery wait --for=delete pod -l app.kubernetes.io/instance=restaurant-pizza
+./scripts/lab-publish.sh valid 8
+```
+
+```
+name                          consumers  messages_ready
+restaurant.restaurant-pizza        0            8
+order-projection                   2            0
+food.dead                          0            0
+```
+
+Exakt acht Nachrichten auf `ready`, kein Consumer. Die Queue ist `durable`, die Nachrichten
+werden mit `delivery_mode: 2` publiziert — der Rückstau liegt auf dem PVC und überlebt einen
+Broker-Neustart.
+
+Aufschlussreich ist die Zeile darunter: `order-projection` steht bei **0**, obwohl dieselben acht
+Events auch dort gelandet sind. Der Routing Key `order.created.restaurant-pizza` passt auf die
+Bindung `order.#` des Order Workers. Dessen zwei Pods liefen weiter und haben ihre Kopien sofort
+verarbeitet. Ein Consumer-Ausfall staut also nur seine eigene Queue — die übrigen Konsumenten
+desselben Events merken davon nichts. Genau das ist die Entkopplung, die ein synchroner
+HTTP-Aufruf nicht liefert.
+
+### Abbau mit zwei Consumern
+
+```
+kubectl -n food-delivery scale deployment/restaurant-pizza --replicas=2
+```
+
+```
+name                          consumers  messages_ready
+restaurant.restaurant-pizza        2            0
+```
+
+Die Logs beider Pods zeigen striktes Round Robin:
+
+| Zeit (UTC) | Pod | Order |
+| ---------- | --- | ----- |
+| 18:16:35.944 | `…-qvc2q` | `lab-pizza-…-1` |
+| 18:16:36.098 | `…-ml2rn` | `lab-pizza-…-2` |
+| 18:16:36.859 | `…-qvc2q` | `lab-pizza-…-3` |
+| 18:16:37.022 | `…-ml2rn` | `lab-pizza-…-4` |
+| 18:16:37.791 | `…-qvc2q` | `lab-pizza-…-5` |
+| 18:16:37.941 | `…-ml2rn` | `lab-pizza-…-6` |
+| 18:16:38.709 | `…-qvc2q` | `lab-pizza-…-7` |
+| 18:16:38.873 | `…-ml2rn` | `lab-pizza-…-8` |
+
+**Nachweis Aufgabe 4:** vorher `consumers 0 / messages_ready 8`, nachher `consumers 2 /
+messages_ready 0`. Beteiligte Pods: `restaurant-pizza-6b7d8c5486-qvc2q` (ungerade Nummern) und
+`restaurant-pizza-6b7d8c5486-ml2rn` (gerade Nummern). Acht Nachrichten in 2.93 Sekunden.
+
+Die saubere Abwechslung ist kein Zufall, sondern `Prefetch: 1` in
+`cmd/restaurant-worker/main.go`: jeder Pod bekommt genau eine unbestätigte Nachricht, die
+nächste erst nach dem Ack. Mit hohem Prefetch hätte ein Pod den halben Rückstau vorab in seinen
+lokalen Puffer gezogen und der zweite hätte kaum etwas zu tun bekommen — sichtbar wäre dann
+Skalierung ohne Wirkung.
+
+### Nebenbefund: der Kurier ist der eigentliche Engpass
+
+Nach dem Abbau standen fünf Nachrichten auf `courier-dispatch`. `courier-simulator-0` ist eine
+einzelne Replik und braucht pro Auslieferung rund 20 Sekunden Fahrzeit; acht gleichzeitig
+angenommene Bestellungen kann er nur nacheinander abarbeiten. Der Restaurant-Rückstau war in drei
+Sekunden weg, der Kurier-Rückstau nicht — die Queue macht den Engpass sichtbar, statt ihn wie ein
+synchroner Aufruf in Timeouts zu verstecken.
+
+Zweite Beobachtung dabei: `courier-simulator` wertet `simulation.paused` nicht aus — anders als
+der Customer-Simulator hat er keine Behandlung dafür. Er hat während der pausierten Simulation
+weiter ausgeliefert. Fachlich ist das inkonsistent; für diesen Block ohne Folgen, aber es ist der
+Grund, warum die Pause nur die Produktion und nicht die Verarbeitung stoppt.
+
+## Aufgabe 5 – Ungültige Nachricht in der Dead Letter Queue isolieren
+
+```
+kubectl -n food-delivery exec rabbitmq-0 -- rabbitmqctl purge_queue food.dead
+./scripts/lab-publish.sh invalid
+```
+
+Publiziert wird der Payload `this-is-not-json` mit dem regulären Routing Key
+`order.created.restaurant-pizza` — eine syntaktisch gültige AMQP-Nachricht mit fachlich
+unlesbarem Inhalt.
+
+```
+name                          messages_ready
+food.dead                           3
+restaurant.restaurant-pizza         0
+order-projection                    0
+```
+
+**Nachweis Aufgabe 5:** `food.dead` enthält **drei** Kopien. Der `x-death`-Header jeder Kopie
+nennt ihre Herkunft:
+
+| Herkunftsqueue | reason | count | Bindung, über die die Kopie entstand |
+| -------------- | ------ | ----- | ------------------------------------ |
+| `restaurant.restaurant-pizza` | rejected | 1 | Routing Key des Restaurants |
+| `order-projection` | rejected | 1 | `order.#` |
+| `live.control-api-6c9598cb5c-c9bnp` | rejected | 1 | `#` |
+
+### Warum dieselbe Publikation mehrfach dead-lettered wird
+
+Weil es nicht dieselbe Nachricht ist. `food.events` ist ein **Topic Exchange**: er liefert eine
+Publikation an *jede* Queue, deren Bindung auf den Routing Key passt. Drei Bindungen passen auf
+`order.created.restaurant-pizza`, also entstehen im Broker drei eigenständige Kopien mit je
+eigenem Ack-Lebenszyklus. Alle drei Consumer scheitern am selben `json.Unmarshal`, jeder
+quittiert seine Kopie mit einem Reject ohne Requeue, und jede Queue trägt
+`x-dead-letter-exchange: food.dlx` (`internal/messaging/rabbitmq.go:117`). Damit wandern drei
+Kopien über `food.dlx` in die mit `#` gebundene `food.dead`.
+
+Der Beleg dafür, dass es Fan-out und keine Wiederholschleife ist, steht in `count: 1`: jede Kopie
+wurde genau einmal dead-lettered. Ein Retry-Loop würde stattdessen eine Kopie mit steigendem
+Zähler zeigen. Die Zahl der DLQ-Einträge ist also keine Fehlerhäufigkeit, sondern die Anzahl der
+Konsumenten, die dieses Event fachlich interessiert hat.
+
+Dass die Kopie in `live.<pod>` denselben Weg geht, ist ein Nebeneffekt der `#`-Bindung: der
+SSE-Stream des Dashboards abonniert bewusst alles und stolpert deshalb über jede kaputte
+Nachricht mit.
+
+### Die regulären Queues bleiben verarbeitbar
+
+Alle fachlichen Queues stehen nach dem Vorfall wieder bei `messages_ready 0`, die Consumer sind
+verbunden, und `restaurant-pizza` ist auf `1/1` zurückgesetzt. Die vergiftete Nachricht hat keine
+Queue blockiert — sie wurde beim ersten Zustellversuch aussortiert, statt endlos requeued zu
+werden und den Kopf der Queue zu belegen. Das ist der Unterschied zwischen `nack(requeue=false)`
+mit DLX und einem naiven Retry.
+
+Die drei Kopien liegen weiterhin in `food.dead` und werden von niemandem konsumiert
+(`consumers 0`). Sie sind Beweismittel, kein Betriebszustand — in einem echten System hinge dort
+ein Alarm oder ein Wiedereinspielungs-Werkzeug.
+
 ## Was Block 5 nicht löst
 
 Der Zustand ist verteilt, aber nicht haltbar. Der `order-worker` besitzt nur einen lokalen
@@ -254,8 +396,11 @@ Broker           rabbitmq:4.3.5-management-alpine, StatefulSet 1/1, PVC 1Gi Boun
 Exchanges        food.events (topic), food.dlx (topic)
 Queues           8, davon 7 durable
 Eventkette       created → accepted → courier_to_restaurant → in_transit → delivered
-Abweichung       Probe-Timeouts in rabbitmq.yaml erhöht (siehe Aufgabe 2)
-Offen            Aufgabe 4 (Rückstau/Competing Consumers), Aufgabe 5 (Dead Letter Queue)
+Rückstau         0 Consumer -> 8 ready; 2 Consumer -> 0 ready in 2.93 s, striktes Round Robin
+DLQ              food.dead 3 Kopien, alle reason=rejected count=1
+Endstand         restaurant-pizza 1/1, Simulation läuft, alle fachlichen Queues bei 0
+Abweichungen     Probe-Timeouts in rabbitmq.yaml erhöht (Aufgabe 2);
+                 Simulation für die Messung in Aufgabe 4 pausiert
 ```
 
 ## Aufräumen
