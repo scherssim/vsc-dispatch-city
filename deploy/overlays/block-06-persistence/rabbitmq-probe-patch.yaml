@@ -9,8 +9,17 @@ spec:
       containers:
         - name: rabbitmq
           readinessProbe:
-            timeoutSeconds: 5
+            initialDelaySeconds: 30
+            timeoutSeconds: 15
             failureThreshold: 6
           livenessProbe:
-            timeoutSeconds: 5
+            initialDelaySeconds: 120
+            timeoutSeconds: 25
             failureThreshold: 6
+          resources:
+            limits:
+              cpu: "2"
+              memory: 768Mi
+            requests:
+              cpu: 200m
+              memory: 256Mi
